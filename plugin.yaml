@@ -1,0 +1,12 @@
+name: identity
+version: 1.0.0
+description: "Identity — view and edit SOUL.md, MEMORY.md, USER.md, AGENT.md with profile/persona switching and per-line utilization tracking."
+provides_tools:
+  - identity_view
+  - identity_edit
+  - identity_switch_profile
+  - identity_dashboard
+  - identity_list_profiles
+provides_hooks:
+  - pre_llm_call
+  - post_tool_call

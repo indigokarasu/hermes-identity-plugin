@@ -1,0 +1,16 @@
+{
+  "name": "identity",
+  "label": "Identity",
+  "description": "View and edit SOUL.md, MEMORY.md, USER.md, AGENT.md with per-line utilization tracking and profile switching.",
+  "icon": "Eye",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/identity",
+    "position": "after:skills",
+    "override": null,
+    "hidden": false
+  },
+  "slots": [],
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
