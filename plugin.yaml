@@ -1,6 +1,7 @@
 name: identity
 version: 1.0.0
 description: "Identity — view and edit SOUL.md, MEMORY.md, USER.md, AGENT.md with profile/persona switching and per-line utilization tracking."
+source: https://github.com/indigokarasu/hermes-identity-plugin
 provides_tools:
   - identity_view
   - identity_edit
