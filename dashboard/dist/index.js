@@ -1,590 +1,369 @@
+/**
+ * Identity Dashboard Plugin — real Hermes dashboard plugin (SDK / React IIFE).
+ *
+ * Renders live data from:
+ *   GET  /api/plugins/identity/dashboard
+ *        → { profile, total_lines, referenced_lines,
+ *            files:[{ name, exists, total_lines, referenced_lines,
+ *                     lines:[{ line_num, content, utilized_at, relative, color }] }] }
+ *   GET  /api/plugins/identity/profiles
+ *        → { current_profile, profiles:[{ name, identity_files }] }
+ *   POST /api/plugins/identity/switch-profile  body {profile}
+ *
+ * Freshness colors: green(<6h FRESH) yellow(<24h RECENT) orange(<1wk AGING) red(>1wk/never STALE).
+ * Theme-native: dashboard tokens (var(--color-*)) + Tailwind classes + SDK components.
+ * Real data only — profiles, lines and counts come straight from the endpoints.
+ */
 (function () {
   "use strict";
+
   var SDK = window.__HERMES_PLUGIN_SDK__;
   var PLUGINS = window.__HERMES_PLUGINS__;
-
-  if (!SDK || !PLUGINS) {
-    console.error("[identity] SDK not available");
-    return;
-  }
+  if (!SDK || !PLUGINS) { console.error("[identity] Hermes plugin SDK not available."); return; }
 
   var React = SDK.React;
+  var h = React.createElement;
   var useState = SDK.hooks.useState;
   var useEffect = SDK.hooks.useEffect;
   var useCallback = SDK.hooks.useCallback;
   var useMemo = SDK.hooks.useMemo;
-  var cn = SDK.utils.cn;
+  var fetchJSON = SDK.fetchJSON;
+  var C = SDK.components;
+  var Card = C.Card, CardHeader = C.CardHeader, CardTitle = C.CardTitle, CardContent = C.CardContent;
+  var Badge = C.Badge, Button = C.Button;
+  var Spinner = C.Spinner || function (p) { return h("span", { className: (p.className || "") + " animate-pulse" }, "…"); };
+  var cn = (SDK.utils && SDK.utils.cn) || function () { return Array.prototype.filter.call(arguments, Boolean).join(" "); };
 
-  var Card = SDK.components.Card;
-  var CardHeader = SDK.components.CardHeader;
-  var CardTitle = SDK.components.CardTitle;
-  var CardContent = SDK.components.CardContent;
-  var Badge = SDK.components.Badge;
-  var Button = SDK.components.Button;
-  var Input = SDK.components.Input;
-  var Label = SDK.components.Label;
-  var Select = SDK.components.Select;
-  var SelectOption = SDK.components.SelectOption;
-  var Separator = SDK.components.Separator;
-  var Spinner = SDK.components.Spinner;
+  // --- color → hex (line freshness) + ordered metadata ---
+  var HEX = { green: "#4fd6a6", yellow: "#f0b54e", orange: "#d29a5e", red: "#f0706e" };
+  var ORDER = ["green", "yellow", "orange", "red"];
+  var FRESH_LABEL = { green: "FRESH", yellow: "RECENT", orange: "AGING", red: "STALE" };
+  function hex(color) { return HEX[color] || HEX.red; }
 
-  // ── Color helpers ──────────────────────────────────────────────────────────
-
-  var COLOR_MAP = {
-    green: { bg: "#059669", text: "#fff", label: "green" },
-    yellow: { bg: "#d97706", text: "#fff", label: "yellow" },
-    orange: { bg: "#ea580c", text: "#fff", label: "orange" },
-    red: { bg: "#dc2626", text: "#fff", label: "red" },
+  // role labels for the four identity files
+  var ROLE = {
+    "SOUL.md": "persona core",
+    "MEMORY.md": "working memory",
+    "USER.md": "about Jared",
+    "AGENT.md": "operating rules"
   };
 
-  var TONE_MAP = {
-    green: "success",
-    yellow: "warning",
-    orange: "warning",
-    danger: "danger",
-  };
+  var STALE_CAP = 12;
 
-  function colorBadge(color) {
-    var c = COLOR_MAP[color] || COLOR_MAP.red;
-    return React.createElement(
-      "span",
-      {
-        style: {
-          display: "inline-block",
-          width: 8,
-          height: 8,
-          borderRadius: "50%",
-          background: c.bg,
-          marginRight: 6,
-          flexShrink: 0,
-        },
-      }
+  // --- one-time scoped CSS injection (unique prefix idn-) ---
+  function injectCSS() {
+    if (document.getElementById("idn-css")) return;
+    var s = document.createElement("style");
+    s.id = "idn-css";
+    s.textContent = [
+      ".idn{display:flex;flex-direction:column;gap:1rem}",
+      ".idn-profile{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}",
+      ".idn-profile-name{font-size:1rem;font-weight:500;display:flex;align-items:center;gap:.45rem}",
+      ".idn-switch{display:flex;align-items:center;gap:.4rem;flex-wrap:wrap}",
+      // KPI strip — equal columns, label reserves 2 lines so values align
+      ".idn-kpis{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:.75rem}",
+      ".idn-kpi-l{font-size:.7rem;letter-spacing:.06em;text-transform:uppercase;color:var(--color-muted-foreground);min-height:2.4em;line-height:1.3}",
+      ".idn-kpi-v{font-size:1.6rem;font-weight:300;line-height:1;margin-top:.35rem}",
+      ".idn-kpi-v small{font-size:.9rem;font-weight:400;color:var(--color-muted-foreground);margin-left:.15rem}",
+      // freshness card: donut left, legend right
+      ".idn-fresh{display:flex;align-items:center;gap:1.5rem;flex-wrap:wrap}",
+      ".idn-legend{display:flex;flex-direction:row;flex-wrap:wrap;gap:1rem;flex:1 1 auto;min-width:0}",
+      ".idn-leg{display:flex;align-items:center;gap:.45rem;font-size:.8rem;white-space:nowrap}",
+      ".idn-leg-name{color:var(--color-muted-foreground);letter-spacing:.04em}",
+      ".idn-leg-n{font-weight:500}",
+      // dots — vertically centered with text
+      ".idn-dot{width:.55rem;height:.55rem;border-radius:9999px;flex:0 0 auto}",
+      // per-file viewer
+      ".idn-file-hd{display:flex;align-items:center;gap:.6rem;width:100%;text-align:left;flex-wrap:wrap}",
+      ".idn-file-name{font-weight:500;font-size:.9rem}",
+      ".idn-file-role{font-size:.72rem;color:var(--color-muted-foreground)}",
+      ".idn-file-meta{margin-left:auto;display:flex;align-items:center;gap:.6rem;font-size:.75rem;color:var(--color-muted-foreground)}",
+      ".idn-caret{display:inline-block;width:1rem;color:var(--color-muted-foreground);transition:transform .12s ease}",
+      ".idn-caret.open{transform:rotate(90deg)}",
+      ".idn-lines{display:flex;flex-direction:column;border:1px solid var(--color-border);border-radius:6px;margin-top:.5rem;overflow:hidden}",
+      ".idn-line{display:flex;align-items:center;gap:.55rem;padding:.18rem .6rem;font-size:.78rem;border-top:1px solid var(--color-border)}",
+      ".idn-line:first-child{border-top:none}",
+      ".idn-line-num{flex:0 0 auto;width:2.2rem;text-align:right;font-variant-numeric:tabular-nums;color:var(--color-muted-foreground);opacity:.7;font-size:.72rem}",
+      ".idn-line-txt{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}",
+      ".idn-line-rel{flex:0 0 auto;color:var(--color-muted-foreground);font-size:.72rem;white-space:nowrap}",
+      // stale review rows
+      ".idn-stale-row{display:flex;align-items:center;gap:.55rem;padding:.2rem 0;font-size:.8rem;border-top:1px solid var(--color-border)}",
+      ".idn-stale-row:first-child{border-top:none}",
+      ".idn-stale-loc{flex:0 0 auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.72rem;color:var(--color-muted-foreground);white-space:nowrap}",
+      ".idn-stale-txt{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      ".idn-stale-rel{flex:0 0 auto;color:var(--color-muted-foreground);font-size:.72rem;white-space:nowrap}",
+      // donut
+      ".idn-donut{position:relative;width:140px;height:140px;flex:none}",
+      ".idn-donut::before{content:\"\";position:absolute;inset:0;border-radius:50%;background:var(--g);-webkit-mask:radial-gradient(circle farthest-side,#0000 calc(100% - 20px),#000 calc(100% - 20px));mask:radial-gradient(circle farthest-side,#0000 calc(100% - 20px),#000 calc(100% - 20px))}",
+      ".idn-donut .ctr{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}",
+      ".idn-donut .ctr .n{font-size:2rem;font-weight:300;line-height:1}",
+      ".idn-donut .ctr .t{font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;color:var(--color-muted-foreground);margin-top:.2rem}",
+      "@media(max-width:760px){.idn-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}",
+    ].join("");
+    document.head.appendChild(s);
+  }
+
+  // --- small reusable bits ---
+  function dot(color, extra) {
+    return h("span", { className: cn("idn-dot", extra), style: { background: hex(color) } });
+  }
+  function Kpi(label, value, unit) {
+    return h("div", { className: "idn-kpi" },
+      h("div", { className: "idn-kpi-l" }, label),
+      h("div", { className: "idn-kpi-v" }, value, unit ? h("small", null, unit) : null)
     );
   }
 
-  // ── File Editor Modal ───────────────────────────────────────────────────────
-
-  function EditModal({ file, profile, onClose, onSave }) {
-    var content = file.content || "";
-    var lines = content.split("\n");
-
-    var _a = useState("replace_line");
-    var mode = _a[0], setMode = _a[1];
-    var _b = useState("");
-    var editContent = _b[0], setEditContent = _b[1];
-    var _c = useState(1);
-    var lineNum = _c[0], setLineNum = _c[1];
-    var _d = useState("");
-    var sectionName = _d[0], setSectionName = _d[1];
-    var _e = useState(false);
-    var saving = _e[0], setSaving = _e[1];
-    var _f = useState(null);
-    var resultMsg = _f[0], setResultMsg = _f[1];
-
-    var handleSave = useCallback(function () {
-      setSaving(true);
-      setResultMsg(null);
-      var body = { filename: file.filename, profile: profile, mode: mode, content: editContent };
-      if (mode === "replace_line") body.line_num = lineNum;
-      if (mode === "replace_section") body.section = sectionName;
-
-      SDK.fetchJSON("/api/plugins/identity/edit", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      })
-        .then(function (data) {
-          setSaving(false);
-          setResultMsg({ ok: true, text: mode + " saved successfully" });
-          if (onSave) onSave();
-        })
-        .catch(function (err) {
-          setSaving(false);
-          setResultMsg({ ok: false, text: err.message || "Save failed" });
-        });
-    }, [file.filename, profile, mode, editContent, lineNum, sectionName, onSave]);
-
-    return React.createElement(
-      "div",
-      {
-        style: {
-          position: "fixed",
-          inset: 0,
-          zIndex: 50,
-          background: "rgba(0,0,0,0.5)",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          padding: 24,
-        },
-        onClick: function (e) { if (e.target === e.currentTarget) onClose(); },
-      },
-      React.createElement(
-        Card,
-        { style: { width: "100%", maxWidth: 720, maxHeight: "90vh", display: "flex", flexDirection: "column" } },
-        React.createElement(
-          CardHeader,
-          null,
-          React.createElement(CardTitle, null, "Edit ", React.createElement("code", null, file.filename))
-        ),
-        React.createElement(
-          CardContent,
-          { style: { display: "flex", flexDirection: "column", gap: 12, overflow: "auto" } },
-
-          // Mode selector
-          React.createElement(
-            "div",
-            { style: { display: "flex", gap: 8, flexWrap: "wrap" } },
-            ["replace_line"].map(function (m) {
-              return React.createElement(
-                Button,
-                {
-                  key: m,
-                  variant: mode === m ? "default" : "outline",
-                  size: "sm",
-                  onClick: function () { setMode(m); setResultMsg(null); },
-                },
-                m === "replace_line" ? "Replace Line" : m
-              );
-            })
-          ),
-
-          // Line preview
-          React.createElement(
-            "div",
-            {
-              style: {
-                maxHeight: 200,
-                overflow: "auto",
-                border: "1px solid var(--color-border)",
-                borderRadius: 6,
-                fontSize: 12,
-                lineHeight: "1.6",
-                fontFamily: "monospace",
-              },
-            },
-            lines.map(function (l, i) {
-              return React.createElement(
-                "div",
-                {
-                  key: i,
-                  style: {
-                    padding: "1px 8px",
-                    background: i === lineNum - 1 ? "var(--color-ring)" : "transparent",
-                    color: i === lineNum - 1 ? "#000" : "inherit",
-                    cursor: "pointer",
-                  },
-                  onClick: function () { setLineNum(i + 1); },
-                },
-                React.createElement("span", { style: { opacity: 0.4, marginRight: 8, display: "inline-block", width: 30, textAlign: "right" } }, i + 1),
-                l || "(blank)"
-              );
-            })
-          ),
-
-          // Line number for replace_line
-          mode === "replace_line" &&
-            React.createElement(
-              "div",
-              null,
-              React.createElement(Label, null, "Line Number"),
-              React.createElement(Input, {
-                type: "number",
-                min: 1,
-                max: lines.length,
-                value: lineNum,
-                onChange: function (e) { setLineNum(parseInt(e.target.value, 10) || 1); },
-                style: { width: 100 } })
-            ),
-
-          // Section name for replace_section
-          mode === "replace_section" &&
-            React.createElement(
-              "div",
-              null,
-              React.createElement(Label, null, "Section Heading"),
-              React.createElement(Input, {
-                value: sectionName,
-                onChange: function (e) { setSectionName(e.target.value); },
-                placeholder: "e.g. Ethos",
-              })
-            ),
-
-          // Content
-          React.createElement(
-            "div",
-            null,
-            React.createElement(Label, null, "New Content"),
-            React.createElement("textarea", {
-              value: editContent,
-              onChange: function (e) { setEditContent(e.target.value); },
-              style: {
-                width: "100%",
-                minHeight: 80,
-                fontFamily: "monospace",
-                fontSize: 13,
-                padding: 8,
-                border: "1px solid var(--color-border)",
-                borderRadius: 6,
-                background: "var(--color-card)",
-                color: "var(--color-card-foreground)",
-                resize: "vertical",
-              },
-            })
-          ),
-
-          // Result message
-          resultMsg &&
-            React.createElement(
-              "div",
-              {
-                style: {
-                  padding: "8px 12px",
-                  borderRadius: 6,
-                  background: resultMsg.ok ? "rgba(5,150,105,0.1)" : "rgba(220,38,38,0.1)",
-                  color: resultMsg.ok ? "#059669" : "#dc2626",
-                  fontSize: 13,
-                },
-                role: "alert",
-              },
-              resultMsg.text
-            ),
-
-          // Actions
-          React.createElement(
-            "div",
-            { style: { display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 8 } },
-            React.createElement(Button, { variant: "outline", onClick: onClose }, "Cancel"),
-            React.createElement(
-              Button,
-              { onClick: handleSave, disabled: saving },
-              saving ? "Saving…" : "Save"
-            )
-          )
-        )
+  // --- donut (segments green,yellow,orange,red by count) ---
+  function Donut(counts) {
+    var total = counts.green + counts.yellow + counts.orange + counts.red;
+    var pct = function (n) { return total > 0 ? (n / total) * 100 : 0; };
+    var g = pct(counts.green);
+    var gy = g + pct(counts.yellow);
+    var gyo = gy + pct(counts.orange);
+    var gradient = total > 0
+      ? "conic-gradient(" + HEX.green + " 0 " + g + "%, "
+        + HEX.yellow + " " + g + "% " + gy + "%, "
+        + HEX.orange + " " + gy + "% " + gyo + "%, "
+        + HEX.red + " " + gyo + "% 100%)"
+      : "conic-gradient(var(--color-muted) 0 100%)";
+    return h("div", { className: "idn-donut", style: { "--g": gradient } },
+      h("div", { className: "ctr" },
+        h("span", { className: "n", style: { color: counts.red ? HEX.red : "inherit" } }, counts.red),
+        h("span", { className: "t" }, "stale")
       )
     );
   }
 
-  // ── File Viewer ─────────────────────────────────────────────────────────────
+  // --- per-file expandable viewer ---
+  function FileSection(props) {
+    var f = props.file;
+    var es = useState(props.defaultOpen), open = es[0], setOpen = es[1];
+    var lines = f.lines || [];
+    var staleN = lines.filter(function (l) { return l.color === "red"; }).length;
 
-  function FileViewer({ fileData, profile, onEdit }) {
-    var _a = useState(true);
-    var showAll = _a[0], setShowAll = _a[1];
-    var lines = fileData.lines || [];
-    var referencedOnly = useMemo(function () {
-      if (showAll) return lines;
-      return lines.filter(function (l) { return l.utilized_at != null; });
-    }, [lines, showAll]);
-
-    return React.createElement(
-      Card,
-      null,
-      React.createElement(
-        CardHeader,
-        { style: { paddingBottom: 8 } },
-        React.createElement(
-          "div",
-          { style: { display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%" } },
-          React.createElement(
-            CardTitle,
-            { style: { fontSize: 16 } },
-            fileData.filename,
-            " ",
-            React.createElement(
-              "span",
-              { style: { fontWeight: 400, opacity: 0.6, fontSize: 13 } },
-              "(",
-              fileData.referenced_lines,
-              "/",
-              fileData.total_lines,
-              " referenced)"
-            )
-          ),
-          React.createElement(
-            "div",
-            { style: { display: "flex", gap: 8 } },
-            React.createElement(
-              Button,
-              { variant: "ghost", size: "sm", onClick: function () { setShowAll(!showAll); } },
-              showAll ? "Referenced Only" : "Show All"
-            ),
-            React.createElement(
-              Button,
-              { variant: "outline", size: "sm", onClick: function () { onEdit(fileData); } },
-              "Edit"
-            )
-          )
-        )
-      ),
-      React.createElement(
-        CardContent,
-        { style: { paddingTop: 0 } },
-        React.createElement(
-          "div",
-          {
-            style: {
-              maxHeight: 400,
-              overflow: "auto",
-              border: "1px solid var(--color-border)",
-              borderRadius: 6,
-              fontSize: 12,
-              lineHeight: "1.7",
-              fontFamily: "monospace",
-            },
-          },
-          referencedOnly.length === 0
-            ? React.createElement("div", { style: { padding: 16, opacity: 0.5 } }, showAll ? "(empty file)" : "(no references tracked yet)")
-            : referencedOnly.map(function (line) {
-                return React.createElement(
-                  "div",
-                  {
-                    key: line.line_num,
-                    style: {
-                      padding: "1px 8px",
-                      borderBottom: "1px solid var(--color-border)",
-                      borderLeft: "3px solid " + (COLOR_MAP[line.color] ? COLOR_MAP[line.color].bg : "#dc2626"),
-                      background: line.utilized_at ? "transparent" : "rgba(220,38,38,0.03)",
-                    },
-                  },
-                  React.createElement(
-                    "span",
-                    { style: { opacity: 0.35, marginRight: 8, display: "inline-block", width: 30, textAlign: "right", fontSize: 11 } },
-                    line.line_num
-                  ),
-                  React.createElement(
-                    Badge,
-                    { tone: TONE_MAP[line.color] || "outline", style: { marginRight: 8, fontSize: 10, padding: "1px 6px" } },
-                    line.relative
-                  ),
-                  React.createElement("span", null, line.content || "(blank)")
-                );
-              })
+    var header = h(Button, {
+      variant: "ghost",
+      size: "sm",
+      className: "w-full justify-start px-2",
+      onClick: function () { setOpen(!open); },
+      "aria-expanded": open
+    },
+      h("div", { className: "idn-file-hd" },
+        h("span", { className: cn("idn-caret", open ? "open" : null) }, "▶"),
+        h("span", { className: "idn-file-name" }, f.name),
+        h("span", { className: "idn-file-role" }, ROLE[f.name] || ""),
+        h("div", { className: "idn-file-meta" },
+          h("span", null, f.referenced_lines + "/" + f.total_lines + " referenced"),
+          staleN
+            ? h(Badge, { tone: "destructive" }, staleN + " stale")
+            : h("span", { style: { color: HEX.green } }, "0 stale")
         )
       )
     );
+
+    if (!f.exists) {
+      return h("div", { className: "flex flex-col" },
+        h("div", { className: "idn-file-hd px-2 py-1 opacity-60" },
+          h("span", { className: "idn-file-name" }, f.name),
+          h("span", { className: "idn-file-role" }, ROLE[f.name] || ""),
+          h("div", { className: "idn-file-meta" }, h("span", null, "not found"))
+        )
+      );
+    }
+
+    var body = null;
+    if (open) {
+      // natural line_num order
+      var ordered = lines.slice().sort(function (a, b) { return (a.line_num || 0) - (b.line_num || 0); });
+      body = h("div", { className: "idn-lines" },
+        ordered.length === 0
+          ? h("div", { className: "px-2 py-2 text-xs text-muted-foreground" }, "(empty file)")
+          : ordered.map(function (l) {
+              return h("div", { key: l.line_num, className: "idn-line" },
+                h("span", { className: "idn-line-num" }, l.line_num),
+                dot(l.color),
+                h("span", { className: "idn-line-txt", title: l.content || "" }, l.content || ""),
+                h("span", { className: "idn-line-rel" }, l.relative || "")
+              );
+            })
+      );
+    }
+
+    return h("div", { className: "flex flex-col" }, header, body);
   }
 
-  // ── Main Page ───────────────────────────────────────────────────────────────
+  function IdentityDashboard() {
+    var ds = useState(null), data = ds[0], setData = ds[1];
+    var ps = useState(null), prof = ps[0], setProf = ps[1];
+    var ls = useState(true), loading = ls[0], setLoading = ls[1];
+    var es = useState(null), err = es[0], setErr = es[1];
+    var bs = useState(false), busy = bs[0], setBusy = bs[1];
 
-  function IdentityPage() {
-    var _a = useState(null);
-    var data = _a[0], setData = _a[1];
-    var _b = useState(true);
-    var loading = _b[0], setLoading = _b[1];
-    var _c = useState(null);
-    var error = _c[0], setError = _c[1];
-    var _d = useState(null);
-    var profiles = _d[0], setProfiles = _d[1];
-    var _e = useState(null);
-    var selectedProfile = _e[0], setSelectedProfile = _e[1];
-    var _f = useState(null);
-    var editingFile = _f[0], setEditingFile = _f[1];
-    var _g = useState(0);
-    var refreshKey = _g[0], setRefreshKey = _g[1];
-
-    var fetchData = useCallback(function () {
-      setLoading(true);
-      setError(null);
-      var profile = selectedProfile;
-      var url = "/api/plugins/identity/dashboard" + (profile ? "?profile=" + encodeURIComponent(profile) : "");
-      var profilesUrl = "/api/plugins/identity/profiles";
-
+    var load = useCallback(function () {
       Promise.all([
-        SDK.fetchJSON(url),
-        SDK.fetchJSON(profilesUrl),
+        fetchJSON("/api/plugins/identity/dashboard"),
+        fetchJSON("/api/plugins/identity/profiles")
       ])
-        .then(function (results) {
-          var dashData = results[0];
-          var profData = results[1];
-          setData(dashData);
-          setProfiles(profData);
-          if (!selectedProfile) setSelectedProfile(dashData.profile);
-          setLoading(false);
-        })
-        .catch(function (err) {
-          setError(err.message || "Failed to load");
-          setLoading(false);
-        });
-    }, [selectedProfile]);
+        .then(function (r) { setData(r[0]); setProf(r[1]); setErr(null); setLoading(false); })
+        .catch(function (e) { setErr((e && e.message) || "Failed to load"); setLoading(false); });
+    }, []);
 
-    useEffect(function () { fetchData(); }, [fetchData, refreshKey]);
+    useEffect(function () {
+      injectCSS();
+      load();
+      var iv = setInterval(load, 60000);
+      return function () { clearInterval(iv); };
+    }, [load]);
 
-    var handleProfileSwitch = useCallback(function (newProfile) {
-      SDK.fetchJSON("/api/plugins/identity/switch-profile", {
+    var switchProfile = useCallback(function (name) {
+      setBusy(true);
+      fetchJSON("/api/plugins/identity/switch-profile", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ profile: newProfile }),
+        body: JSON.stringify({ profile: name })
       })
-        .then(function () {
-          setSelectedProfile(newProfile);
-          setData(null);
-          setRefreshKey(function (k) { return k + 1; });
-        })
-        .catch(function (err) { setError(err.message || "Switch failed"); });
-    }, []);
+        .then(function () { return load(); })
+        .catch(function (e) { setErr("Switch failed: " + ((e && e.message) || "error")); })
+        .finally(function () { setBusy(false); });
+    }, [load]);
 
-    var handleResetUsage = useCallback(function () {
-      if (!window.confirm("Clear all utilization tracking data?")) return;
-      SDK.fetchJSON("/api/plugins/identity/reset-usage", { method: "POST" })
-        .then(function () { setRefreshKey(function (k) { return k + 1; }); })
-        .catch(function (err) { setError(err.message || "Reset failed"); });
-    }, []);
-
-    var handleFetchFileForEdit = useCallback(function (fileSummary) {
-      var profile = selectedProfile;
-      var url = "/api/plugins/identity/view?filename=" + encodeURIComponent(fileSummary.name) + "&profile=" + encodeURIComponent(profile || "");
-      SDK.fetchJSON(url)
-        .then(function (fileData) {
-          var content = (fileData.lines || []).map(function (l) { return l.content; }).join("\n");
-          setEditingFile({
-            filename: fileData.filename,
-            profile: fileData.profile,
-            content: content,
-          });
-        })
-        .catch(function (err) { setError(err.message || "Failed to load file"); });
-    }, [selectedProfile]);
+    // ---- derived counts (must be before any early return for stable hooks) ----
+    var derived = useMemo(function () {
+      var files = (data && data.files) || [];
+      var counts = { green: 0, yellow: 0, orange: 0, red: 0 };
+      var staleLines = [];
+      files.forEach(function (f) {
+        (f.lines || []).forEach(function (l) {
+          if (counts[l.color] != null) counts[l.color] += 1;
+          if (l.color === "red") {
+            staleLines.push({ file: f.name, line_num: l.line_num, content: l.content || "", relative: l.relative || "" });
+          }
+        });
+      });
+      var existing = files.filter(function (f) { return f.exists; }).length;
+      return { files: files, counts: counts, staleLines: staleLines, existing: existing };
+    }, [data]);
 
     if (loading && !data) {
-      return React.createElement(
-        "div",
-        { style: { display: "flex", alignItems: "center", justifyContent: "center", padding: 48 } },
-        React.createElement(Spinner, null)
-      );
+      return h("div", { className: "flex items-center gap-2 p-8 text-sm text-muted-foreground" },
+        h(Spinner, { className: "h-4 w-4" }), "Loading Identity…");
     }
-
-    if (error) {
-      return React.createElement(
-        Card,
-        null,
-        React.createElement(
-          CardContent,
-          { style: { padding: 24 } },
-          React.createElement("p", { style: { color: "#dc2626" }, role: "alert" }, "Error: ", error),
-          React.createElement(Button, { onClick: fetchData, style: { marginTop: 12 } }, "Retry")
-        )
-      );
+    if (err && !data) {
+      return h("div", { className: "p-4 text-sm text-destructive", role: "alert" },
+        "Error: " + err,
+        h(Button, { size: "sm", variant: "outline", className: "ml-2", onClick: load }, "Retry"));
     }
+    if (!data) return null;
 
-    var files = (data && data.files) || [];
-    var totalLines = (data && data.total_lines) || 0;
-    var totalRefd = (data && data.referenced_lines) || 0;
-    var profList = (profiles && profiles.profiles) || [];
+    var totalLines = data.total_lines || 0;
+    var referenced = data.referenced_lines || 0;
+    var counts = derived.counts;
+    var staleLines = derived.staleLines;
+    var refRate = totalLines > 0 ? Math.round(100 * referenced / totalLines) : 0;
 
-    return React.createElement(
-      "div",
-      { style: { padding: 16, maxWidth: 1200, margin: "0 auto" } },
-
-      // Header controls
-      React.createElement(
-        "div",
-        { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 } },
-        React.createElement(
-          "div",
-          null,
-          React.createElement("h2", { style: { fontSize: 20, fontWeight: 700, margin: 0 } }, "Identity"),
-          React.createElement("p", { style: { fontSize: 13, opacity: 0.6, margin: "4px 0 0" } },
-            totalRefd,
-            "/",
-            totalLines,
-            " lines referenced"
-          )
-        ),
-        React.createElement(
-          "div",
-          { style: { display: "flex", gap: 8, alignItems: "center" } },
-
-          // Profile selector
-          React.createElement(
-            Select,
-            {
-              value: selectedProfile || "",
-              onValueChange: handleProfileSwitch,
-              style: { width: 180 },
-            },
-            profList.map(function (p) {
-              return React.createElement(
-                SelectOption,
-                { key: p.name, value: p.name },
-                p.name,
-                " (",
-                (p.identity_files || []).length,
-                " files)"
-              );
-            })
-          ),
-
-          React.createElement(
-            Button,
-            { variant: "ghost", size: "sm", onClick: fetchData, title: "Refresh" },
-            "↻"
-          ),
-          React.createElement(
-            Button,
-            { variant: "ghost", size: "sm", onClick: handleResetUsage, title: "Reset utilization" },
-"Reset"
-          )
-        )
-      ),
-
-      // Color legend
-      React.createElement(
-        "div",
-        { style: { display: "flex", gap: 16, marginBottom: 16, fontSize: 12 } },
-        Object.keys(COLOR_MAP).map(function (color) {
-          var c = COLOR_MAP[color];
-          return React.createElement(
-            "div",
-            { key: color, style: { display: "flex", alignItems: "center" } },
-            colorBadge(color),
-            React.createElement("span", { style: { textTransform: "capitalize" } }, color)
-          );
-        }),
-        React.createElement("span", { style: { opacity: 0.4 } }, "= utilization frequency")
-      ),
-
-      React.createElement(Separator, { style: { marginBottom: 16 } } ),
-
-      // File cards
-      React.createElement(
-        "div",
-        { style: { display: "flex", flexDirection: "column", gap: 16 } },
-        files.map(function (f) {
-          if (!f.exists) {
-            return React.createElement(
-              Card,
-              { key: f.name },
-              React.createElement(
-                CardContent,
-                { style: { padding: 16, opacity: 0.5 } },
-                f.name, " — not found"
-              )
-            );
-          }
-          return React.createElement(FileViewer, {
-            key: f.name,
-            fileData: f,
-            profile: selectedProfile,
-            onEdit: handleFetchFileForEdit,
-          });
-        })
-      ),
-
-      // Edit modal
-      editingFile
-        ? React.createElement(EditModal, {
-            file: editingFile,
-            profile: selectedProfile,
-            onClose: function () { setEditingFile(null); },
-            onSave: function () {
-              setEditingFile(null);
-              setRefreshKey(function (k) { return k + 1; });
-            },
+    // ---- profile bar (real profiles only) ----
+    var current = (prof && prof.current_profile) || data.profile || "—";
+    var profList = (prof && prof.profiles) || [];
+    var profileBar;
+    if (profList.length > 1) {
+      profileBar = h("div", { className: "idn-profile" },
+        h("span", { className: "idn-profile-name" }, dot("green"), "Profile · " + current),
+        h("div", { className: "idn-switch" },
+          profList.map(function (p) {
+            var active = p.name === current;
+            return h(Button, {
+              key: p.name,
+              size: "sm",
+              variant: active ? "default" : "outline",
+              disabled: busy || active,
+              onClick: function () { switchProfile(p.name); }
+            }, p.name);
           })
-        : null
+        )
+      );
+    } else {
+      profileBar = h("div", { className: "idn-profile" },
+        h("span", { className: "idn-profile-name" }, dot("green"), "Profile · " + current)
+      );
+    }
+
+    // ---- KPI strip (above donut) ----
+    var kpis = h("div", { className: "idn-kpis" },
+      Kpi("Identity files", derived.existing),
+      Kpi("Total lines", totalLines),
+      Kpi("Referenced", referenced),
+      Kpi("Stale lines", counts.red),
+      Kpi("Referenced rate", refRate, "%")
+    );
+
+    // ---- freshness card: donut left + one-line legend right ----
+    var legend = h("div", { className: "idn-legend" },
+      ORDER.map(function (color) {
+        return h("div", { key: color, className: "idn-leg" },
+          dot(color),
+          h("span", { className: "idn-leg-name" }, FRESH_LABEL[color]),
+          h("span", { className: "idn-leg-n" }, counts[color])
+        );
+      })
+    );
+    var freshCard = h(Card, null,
+      h(CardHeader, { className: "pb-2" }, h(CardTitle, { className: "text-sm" }, "Freshness")),
+      h(CardContent, null,
+        h("div", { className: "idn-fresh" }, Donut(counts), legend)
+      )
+    );
+
+    // ---- per-file viewer (MEMORY.md open by default) ----
+    var filesCard = h(Card, null,
+      h(CardHeader, { className: "pb-2" }, h(CardTitle, { className: "text-sm" }, "Identity files")),
+      h(CardContent, null,
+        h("div", { className: "flex flex-col gap-1" },
+          derived.files.map(function (f) {
+            return h(FileSection, { key: f.name, file: f, defaultOpen: f.name === "MEMORY.md" });
+          })
+        )
+      )
+    );
+
+    // ---- stale review card (cap at STALE_CAP, surface the cap) ----
+    var shown = staleLines.slice(0, STALE_CAP);
+    var overflow = staleLines.length - shown.length;
+    var staleCard = h(Card, null,
+      h(CardHeader, { className: "pb-2" }, h(CardTitle, { className: "text-sm" }, "Stale lines · review")),
+      h(CardContent, null,
+        staleLines.length === 0
+          ? h("div", { className: "flex items-center gap-2 text-sm" },
+              dot("green"),
+              h("span", { className: "text-muted-foreground" }, "No stale lines. Everything referenced within the last week."))
+          : h("div", { className: "flex flex-col" },
+              h("div", { className: "flex flex-col" },
+                shown.map(function (s, i) {
+                  return h("div", { key: s.file + ":" + s.line_num + ":" + i, className: "idn-stale-row" },
+                    dot("red"),
+                    h("span", { className: "idn-stale-loc" }, s.file + ":" + s.line_num),
+                    h("span", { className: "idn-stale-txt", title: s.content }, s.content),
+                    h("span", { className: "idn-stale-rel" }, s.relative)
+                  );
+                })
+              ),
+              overflow > 0
+                ? h("div", { className: "text-xs text-muted-foreground pt-2" },
+                    "+" + overflow + " more stale line" + (overflow !== 1 ? "s" : "")
+                    + " (showing first " + STALE_CAP + " of " + staleLines.length + ").")
+                : null
+            )
+      )
+    );
+
+    return h("div", { className: "idn p-4" },
+      profileBar,
+      kpis,
+      freshCard,
+      filesCard,
+      staleCard
     );
   }
 
-  PLUGINS.register("identity", IdentityPage);
+  PLUGINS.register("identity", IdentityDashboard);
 })();
