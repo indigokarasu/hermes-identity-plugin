@@ -278,7 +278,7 @@ def _match_identity_line(stripped: str, text: str) -> bool:
     # Value-match for key: value lines
     if ":" in stripped:
         _, _, value = stripped.partition(":")
-        value = value.strip()
+        value = value.strip().lstrip("*").strip()  # handle **key:** value Markdown
         if len(value) >= _MIN_VALUE_LEN and value.lower() not in _STOP_WORDS:
             if value.lower() in text:
                 return True
