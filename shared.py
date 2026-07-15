@@ -246,7 +246,7 @@ _STOP_WORDS: set[str] = {
 
 # Minimum value length (in chars) to qualify as a match.  Shorter values
 # produce too many false positives (pronouns, single words).
-_MIN_VALUE_LEN = 8
+_MIN_VALUE_LEN = 12
 
 
 def _match_identity_line(stripped: str, text: str) -> bool:
