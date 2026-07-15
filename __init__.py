@@ -16,6 +16,7 @@ from .shared import (
     now_iso,
     relative_timestamp,
     color_for_timestamp,
+    _match_identity_line,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ def _reset() -> str:
 
 # ── Hook: track line references ───────────────────────────────────────────────
 
-# Simple mtime cache for pre_llm_call hook
+# Simple mtime cache for hooks
 _file_cache: dict[str, tuple[float, list[str]]] = {}
 
 def _get_cached_lines(fpath: Path) -> list[str]:
@@ -50,14 +51,24 @@ def _get_cached_lines(fpath: Path) -> list[str]:
     _file_cache[key] = (mtime, lines)
     return lines
 
-def _on_pre_llm_call(session_id, user_message, conversation_history, is_first_turn, model, platform, **kwargs):
-    """Track which identity-file lines are referenced in user messages."""
-    if not user_message:
-        return None
+
+def _stamp_utilization(text: str) -> None:
+    """Check *text* (lowercased) against every identity file line and stamp matches.
+
+    Shared helper used by both the post_llm_call and post_tool_call hooks.
+    Uses ``_match_identity_line()`` from shared — a heuristic that checks
+    both verbatim prefix and key/value value matching (see ``shared.py`` for
+    details and caveats).
+
+    Files load into context every turn, so we do NOT stamp on pre_llm_call/load
+    — only on agent output or actions — so STALE stays meaningful.
+    """
+    if not text:
+        return
     util = load_utilization()
     profile = resolve_active_profile()
     updated = False
-    user_lower = user_message.lower()
+    text_lower = text.lower()
     for fname in IDENTITY_FILES:
         fpath = get_file_path(fname, profile)
         if not fpath.exists():
@@ -69,21 +80,32 @@ def _on_pre_llm_call(session_id, user_message, conversation_history, is_first_tu
             stripped = line.strip()
             if len(stripped) < 10 or stripped.startswith("#"):
                 continue
-            snippet = stripped[:60].lower()
-            if snippet in user_lower:
+            if _match_identity_line(stripped, text_lower):
                 util[f"{fname}:{i}"] = now_iso()
                 updated = True
     if updated:
         save_utilization(util)
+
+
+def _on_post_llm_call(session_id=None, assistant_response=None, **kwargs):
+    """Track which identity-file lines are referenced in the agent's output.
+
+    Registered as a ``post_llm_call`` hook.  Fires once per turn after the
+    tool-calling loop completes, carrying the agent's full ``assistant_response``
+    text.  This is the PRIMARY signal: when the agent actively mentions or
+    leans on a fact, the line gets stamped.
+    """
+    if assistant_response:
+        _stamp_utilization(assistant_response)
     return None
 
+
 def _on_post_tool_call(tool_name, args, result, task_id, duration_ms, **kwargs):
-    """Track identity-file lines referenced in tool arguments."""
+    """Track identity-file lines referenced in tool arguments (agent actions)."""
     # Quick check before expensive serialization
     if isinstance(args, dict):
         keys_str = " ".join(str(k) for k in args.keys())
         if not any(f in keys_str for f in IDENTITY_FILES):
-            # Also check stringified values for file references
             vals_str = " ".join(str(v) for v in args.values() if isinstance(v, str))
             if not any(f in vals_str for f in IDENTITY_FILES):
                 return
@@ -96,23 +118,7 @@ def _on_post_tool_call(tool_name, args, result, task_id, duration_ms, **kwargs):
             return
 
     args_str = json.dumps(args) if isinstance(args, dict) else str(args)
-    util = load_utilization()
-    profile = resolve_active_profile()
-    args_lower = args_str.lower()
-    for fname in IDENTITY_FILES:
-        fpath = get_file_path(fname, profile)
-        if not fpath.exists():
-            continue
-        file_lines = _get_cached_lines(fpath)
-        if not file_lines:
-            continue
-        for i, line in enumerate(file_lines):
-            stripped = line.strip()
-            if len(stripped) < 10 or stripped.startswith("#"):
-                continue
-            if stripped[:60].lower() in args_lower:
-                util[f"{fname}:{i}"] = now_iso()
-    save_utilization(util)
+    _stamp_utilization(args_str)
 
 # ── Tool handlers ─────────────────────────────────────────────────────────────
 
@@ -323,7 +329,7 @@ def _handle_cli(args):
 def register(ctx):
     ctx.register_tool(name="identity_view", toolset="identity",
         schema={"name": "identity_view",
-            "description": "View an identity file (SOUL.md, MEMORY.md, USER.md, AGENT.md) with utilization timestamps shown as color-coded ANSI lines.",
+            "description": "View an identity file (SOUL.md, MEMORY.md, USER.md, AGENT.md) with utilization timestamps shown as color-coded ANSI lines. AGENT.md falls back to HERMES.md when the former doesn't exist.",
             "parameters": {"type": "object",
                 "properties": {"filename": {"type": "string", "enum": IDENTITY_FILES, "description": "Which identity file to view"},
                     "profile": {"type": "string", "description": "Profile name (defaults to active)"}},
@@ -365,7 +371,7 @@ def register(ctx):
             "description": "Reset utilization tracking.",
             "parameters": {"type": "object", "properties": {}}},
         handler=identity_reset_usage)
-    ctx.register_hook("pre_llm_call", _on_pre_llm_call)
+    ctx.register_hook("post_llm_call", _on_post_llm_call)
     ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_command("identity", _handle_slash_identity, description="View identity files and utilization")
     ctx.register_command("identity-switch", _handle_slash_switch, description="Switch profile")
