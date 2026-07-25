@@ -44,7 +44,7 @@
   var ROLE = {
     "SOUL.md": "persona core",
     "MEMORY.md": "working memory",
-    "USER.md": "about Jared",
+    "USER.md": "about the operator",
     "AGENT.md": "operating rules"
   };
 
