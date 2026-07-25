@@ -37,7 +37,7 @@ def _resolve_hermes_home() -> Path:
         if (cursor / "profiles").is_dir():
             return cursor
         cursor = cursor.parent
-    return Path("/root/.hermes")
+    return Path("~/.hermes")
 
 
 HERMES_HOME = _resolve_hermes_home()
@@ -76,7 +76,7 @@ def resolve_active_profile(resolve_dashboard: bool = True) -> str:
     is a dashboard server (``--open-profile`` is set), that value takes
     precedence over the stale ``active_profile`` file.  This ensures the
     plugin API shows the profile the user asked to open, not whatever
-    ``/root/.hermes/active_profile`` contains (often ``commons`` — a
+    ``~/.hermes/active_profile`` contains (often ``commons`` — a
     non-existent profile resulting in a fallback to root files).
 
     Priority:
