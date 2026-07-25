@@ -37,7 +37,7 @@ def _resolve_hermes_home() -> Path:
         if (cursor / "profiles").is_dir():
             return cursor
         cursor = cursor.parent
-    return Path("~/.hermes")
+    return Path(os.path.expanduser("~/.hermes"))
 
 
 HERMES_HOME = _resolve_hermes_home()
